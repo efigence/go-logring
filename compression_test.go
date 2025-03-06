@@ -93,5 +93,5 @@ func BenchmarkS2(b *testing.B) {
 		w.Write(r)
 	}
 	w.Close()
-	b.ReportMetric((float64(b.N) * float64(len(r)) / b.Elapsed().Seconds() / 1024 / 1024), "MB/sec")
+	b.ReportMetric(float64(b.N)*float64(len(r))/b.Elapsed().Seconds()/1024/1024, "MB/sec")
 }
