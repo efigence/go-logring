@@ -3,6 +3,7 @@ package logring
 import (
 	"bytes"
 	"fmt"
+	"github.com/klauspost/compress/zstd"
 	"io"
 	"io/fs"
 	"os"
@@ -16,16 +17,22 @@ type Logring interface {
 	io.WriteCloser
 }
 
+var bufferSize = 65536
+
 type logring struct {
-	buf              bytes.Buffer
+	cfg              *Config
+	buf              *bytes.Buffer
 	dir              string
+	dataSize         int64
+	dataCheckSize    int64
 	fileSize         int64
 	fileCount        int64
-	writer           io.Writer
+	writer           io.WriteCloser
 	compressedWriter countingWriter
 	lock             sync.Mutex
 	prefix           string
 	suffix           string
+	fd               *os.File
 }
 
 type Config struct {
@@ -54,12 +61,16 @@ func NewLogring(dir string, prefix string, cfg Config) (*logring, error) {
 	}
 	singleFileSize := cfg.MaxTotalSize / cfg.Files
 	lr := logring{
+		cfg:       &cfg,
 		dir:       dir,
 		fileSize:  singleFileSize,
 		fileCount: cfg.Files,
 		prefix:    prefix,
+		buf:       &bytes.Buffer{},
 	}
-	di, _ := os.Stat(dir)
+	lr.suffix = "zstd"
+	lr.buf.Grow(bufferSize)
+	di, _ := os.Stat(lr.dir)
 	if !di.IsDir() {
 		err := os.MkdirAll(dir, cfg.DirectoryMode)
 		if err != nil {
@@ -70,7 +81,16 @@ func NewLogring(dir string, prefix string, cfg Config) (*logring, error) {
 	if err != nil {
 		return nil, fmt.Errorf("could not read directory: %s", err)
 	}
+	fn := dir + "/" + lr.nextFileName()
+	lr.fd, err = os.OpenFile(fn, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, cfg.FileMode)
 
+	if err != nil {
+		return nil, err
+	}
+	lr.writer, err = zstd.NewWriter(lr.fd)
+	if err != nil {
+		return nil, err
+	}
 	return &lr, nil
 }
 
@@ -107,13 +127,66 @@ func (lr *logring) nextFileName() string {
 }
 
 func (lr *logring) Write(p []byte) (n int, err error) {
+	lr.dataSize = lr.dataSize + int64(len(p))
+	lr.dataCheckSize = lr.dataCheckSize + int64(len(p))
+	if lr.dataCheckSize > lr.fileSize {
+		lr.checkForRotate()
+	}
 	lr.lock.Lock()
 	defer lr.lock.Unlock()
-	n, err = lr.writer.Write(lr.buf.Bytes())
-	if (lr.buf.Len() + len(p)) > 65535 {
-		lr.buf.WriteTo(lr.writer)
-		lr.buf.Reset()
+	if len(p) <= bufferSize {
+		n, err = lr.buf.Write(p)
+		if (lr.buf.Len()) > 65535 {
+			_, err := lr.buf.WriteTo(lr.writer)
+			if err != nil {
+				return 0, err
+			}
+			lr.buf.Reset()
+		}
+		return n, err
+	} else {
+		if lr.buf.Len() > 0 {
+			_, err := lr.buf.WriteTo(lr.writer)
+			if err != nil {
+				return 0, err
+			}
+		}
+		return lr.writer.Write(p)
 	}
-	return n, err
+}
+func (lr *logring) checkForRotate() {
+	fi, err := lr.fd.Stat()
+	if err != nil {
+		panic(err)
+	}
+	lr.dataCheckSize = 0
+	if fi.Size() > lr.fileSize {
+		lr.Rotate()
+	}
 
+}
+
+func (lr *logring) Rotate() (err error) {
+	lr.lock.Lock()
+	defer lr.lock.Unlock()
+	old := lr.fd
+	defer old.Close()
+	fn := lr.dir + "/" + lr.nextFileName()
+	lr.fd, err = os.OpenFile(fn, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, lr.cfg.FileMode)
+	if err != nil {
+		return err
+	}
+	lr.writer, err = zstd.NewWriter(lr.fd)
+	lr.dataSize = 0
+	lr.dataCheckSize = 0
+	return err
+}
+
+func (lr *logring) Close() {
+	lr.lock.Lock()
+	defer lr.lock.Unlock()
+	if lr.buf.Len() > 0 {
+		lr.buf.WriteTo(lr.writer)
+	}
+	lr.writer.Close()
 }
